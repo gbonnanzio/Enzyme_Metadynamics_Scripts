@@ -3,20 +3,17 @@
 Heating -> equilibration -> well-tempered metadynamics with ASE + PLUMED,
 driving the UMA (FAIRChem) potential in-process on the GPU.
 
-This reproduces the ORCA `ExtOpt MD` workflow in md.inp:
   1. Heat the active region 100 -> 300 K (Langevin thermostat).
   2. Equilibrate at 300 K.
   3. Well-tempered metadynamics on the forming C-C bond (C2 of ThDP <-> donor
      C1, CV_ATOMS below), with lower/upper walls, biasing handled by PLUMED.
 
-The ORCA-frozen atoms are held fixed with FixAtoms; the frozen set is given
-explicitly by FROZEN_ATOMS (0-based) and the active region is its complement.
+Alpha carbons of terminal protein residues are frozen to retain protein structure.
 
-Every water O is held inside a single flat-bottom containment sphere (loose
-Hookean restraint to the centroid of the frozen atoms), active in all three
-phases, so waters cannot evaporate from the non-periodic cluster. The wall radius
+Every water O is held with a loose Hookean restraint to the centroid of the frozen atoms
+so waters cannot evaporate from the non-periodic cluster. The wall radius
 is uniform — the same for every water, independent of where it sits. walls.log
-records how often the wall engages.
+records how often the wall engages (almost never)
 
 Restart: the metadynamics phase resumes from mtd_restart.traj (latest state
 only, written atomically). On resume, HILLS/COLVAR/logs/trajectories are
@@ -29,6 +26,7 @@ Requires the PLUMED python backend in uma-env:
 import os
 
 import numpy as np
+import MDAnalysis as mda
 from ase import Atoms, units
 from ase.io import read, write
 from ase.io.trajectory import Trajectory
@@ -48,13 +46,11 @@ MODEL, DEVICE = "uma-s-1p2", "cuda"          # in-process UMA on the GPU
 
 # ── dynamics ────────────────────────────────────────────────────────────
 TIMESTEP = 0.5 * units.fs
-FRICTION = 1.0 / (100 * units.fs)            # gentler than 1/50 fs; changes kinetics, not the FES
-T_START, T_HEAT, T_RUN = 100.0, 300.0, 300.0
+FRICTION = 1.0 / (100 * units.fs)            
+T_START, T_HEAT, T_RUN = 100.0, 300.0, 300.0 # temperature ramp
 
-# Production: 5 ps heat / 10 ps equil / metadynamics target below.
-# N_MTD is the *cumulative* mtd target; raise it and resubmit to extend the run.
-# ~200k mtd steps fit in one 12 h job, so each resubmit adds ~100 ps.
-N_HEAT, N_EQUIL, N_MTD = 10000, 20000, 2000000
+# Production: 5 ps heat / 10 ps equil / 500 ps metadynamics
+N_HEAT, N_EQUIL, N_MTD = 10000, 20000, 1000000
 # Fast test values were: N_HEAT, N_EQUIL, N_MTD = 2000, 2000, 20000
 DUMP_STRIDE = 100
 MTD_OFFSET = N_HEAT + N_EQUIL                # integrator step at which mtd starts
@@ -64,19 +60,15 @@ RESTART_TRAJ = "mtd_restart.traj"            # latest mtd state (positions, mome
 CHECKPOINT_EVERY = 1000                      # must be a multiple of PACE and DUMP_STRIDE
 
 # ── energy units: defined in kcal/mol, converted to each consumer's unit at use ─
-# Every energy constant below (HEIGHT, KAPPA_*, TETHER_K) is written in kcal/mol
-# (or kcal/mol/A^2) and multiplied by one of these factors where it is used:
-# PLUMED reads kJ/mol (the UNITS line leaves energy at the PLUMED default), while
-# ASE/Hookean reads eV.
 KCAL_TO_KJ = units.kcal / units.kJ           # kcal/mol -> kJ/mol  (= 4.184)
 KCAL_TO_EV = units.kcal / units.mol          # kcal/mol -> eV      (ASE base energy)
 
 # ── metadynamics (lengths in Angstrom; energies in kcal/mol, converted at use) ──
 CV_ATOMS = (444, 679)                        # 0-based (C2 ThDP, C1 donor); +1 for PLUMED
-SIGMA, HEIGHT, PACE = 0.1, 0.5, 50         # width (A), hill height (kcal/mol)
+SIGMA, HEIGHT, PACE = 0.1, 0.5, 50           # width (A), hill height (kcal/mol)
 BIASFACTOR = (300.0 + 8000.0) / 300.0        # ~27.7 from ORCA WellTempered 8000 K (dimensionless)
-WALL_LO, KAPPA_LO = 1.2, 50.0               # lower wall AT 1.2 A; KAPPA kcal/mol/A^2
-WALL_HI, KAPPA_HI = 6.5, 100.0              # upper wall; KAPPA kcal/mol/A^2 (stiffened: 50 let d1 escape)
+WALL_LO, KAPPA_LO = 1.2, 50.0                # lower wall AT 1.2 A; KAPPA kcal/mol/A^2
+WALL_HI, KAPPA_HI = 6.5, 100.0               # upper wall; KAPPA kcal/mol/A^2 
 GRID_MIN, GRID_MAX, GRID_BIN = 0.8, 8.5, 360 # ~0.021 A/bin; walls (1.2/6.5) sit well inside the grid
 
 # FROZEN ATOMS (0-based) — held fixed with FixAtoms; active region is the complement
@@ -84,12 +76,7 @@ fr_str = "0 12 32 109 130 152 200 209 259 266 285 394 411 428 485 528 549 567 58
 FROZEN_ATOMS = [int(i) for i in fr_str.split()]
 
 # ── water containment (flat-bottom spherical wall, ASE Hookean, every phase) ──
-# A single containment sphere centered on the frozen-atom centroid: every water O
-# is free inside the wall radius R and feels E = 0.5*k*(r - R)^2 outside it. R is
-# the SAME for every water (it does not depend on where a given water sits), so the
-# restraint is uniform across the droplet. By default R is sized once to clear the
-# outermost initial water O by CONTAIN_MARGIN; set CONTAIN_RADIUS to pin an absolute
-# radius instead (None = auto-size).
+# every water O is free inside the wall radius R and feels E = 0.5*k*(r - R)^2 outside it. 
 EXPECTED_WATERS = 128
 CONTAIN_MARGIN = 5.0    # A of head-room past the outermost initial water O (auto-size)
 CONTAIN_RADIUS = None   # A; if set, an absolute wall radius used for every water
@@ -97,7 +84,6 @@ TETHER_K = 10.0         # kcal/mol/A^2 (soft: 1 A past the wall = 5 kcal/mol ~8 
 
 # Any extra PLUMED lines (appended to the input). Empty by default.
 EXTRA_PLUMED_LINES = []
-
 
 # ── helpers ─────────────────────────────────────────────────────────────
 def write_plain_xyz(path, atoms, idx=None, with_energy=False):
@@ -122,21 +108,15 @@ def write_plain_xyz(path, atoms, idx=None, with_energy=False):
             f.write(f"{s:<2s} {x:18.8f} {y:18.8f} {z:18.8f}\n")
 
 
-def find_water_oxygens(atoms):
-    """O atoms bonded to exactly two H and nothing else."""
-    # skin=0: the default 0.3 A skin can pull in H-bond partners and miscount
-    nl = NeighborList(natural_cutoffs(atoms), skin=0.0, self_interaction=False,
-                      bothways=True)
-    nl.update(atoms)
-    symbols = atoms.get_chemical_symbols()
-    ox = []
-    for i, s in enumerate(symbols):
-        if s != "O":
-            continue
-        nb = nl.get_neighbors(i)[0]
-        if len(nb) == 2 and all(symbols[j] == "H" for j in nb):
-            ox.append(i)
-    return ox
+def find_water_oxygens(structure=STRUCTURE):
+    """0-based indices of each water oxygen, read straight from the topology:
+    every residue named WAT contributes its oxygen. Selecting by residue name is
+    robust to O-H geometry (a stretched or transferred proton never changes the
+    count), unlike bond-counting. MDAnalysis reads the PDB in file order, so these
+    indices line up 1:1 with the ASE Atoms built from the same file."""
+    u = mda.Universe(structure)
+    water_O = u.select_atoms("resname WAT and name O*")
+    return water_O.indices.tolist()
 
 
 def build_plumed_lines():
@@ -252,11 +232,11 @@ def main():
         raise RuntimeError("a CV atom is in FROZEN_ATOMS")
     print(f"active={len(active_idx)} frozen={len(frozen_idx)} atoms", flush=True)
 
-    # ── water tethers: geometry always from the input PDB, so identical on restart
-    water_O = find_water_oxygens(atoms)
+    # ── water tethers: WAT oxygens read from the input PDB, so identical on restart
+    water_O = find_water_oxygens(STRUCTURE)
     if len(water_O) != EXPECTED_WATERS:
-        raise RuntimeError(f"found {len(water_O)} water O, expected {EXPECTED_WATERS} "
-                           "(check protonation / H3O+ / OH- or bad geometry)")
+        raise RuntimeError(f"found {len(water_O)} WAT oxygens, expected {EXPECTED_WATERS} "
+                           "(check the WAT residue count in the input PDB)")
     pos0 = atoms.get_positions()
     center = pos0[frozen_idx].mean(axis=0)
     r0 = np.linalg.norm(pos0[water_O] - center, axis=1)

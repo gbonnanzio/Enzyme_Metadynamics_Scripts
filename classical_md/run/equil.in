@@ -3,7 +3,7 @@ Production equilibration, NPT, 50 ns
   imin=0,                              ! run dynamics
   irest=1,                             ! continuation: read velocities from the restart
   ntx=5,                               ! read coordinates and velocities
-  nstlim=50000000,                     ! 50,000,000 steps = 50 ns at 1 fs
+  nstlim=100000000,                     ! 50,000,000 steps = 50 ns at 1 fs
   dt=0.001,                            ! timestep, ps
   ntc=2,                               ! SHAKE on bonds to hydrogen
   ntf=2,                               ! skip forces for constrained bonds
