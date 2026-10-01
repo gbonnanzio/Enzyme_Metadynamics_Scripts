@@ -1,0 +1,14 @@
+Minimization
+&cntrl
+  imin=1,                              ! 1 = minimization, not dynamics
+  maxcyc=10000,                        ! total minimization cycles
+  ncyc=1000,                           ! steepest descent for the first 1000, conjugate gradient after
+  drms=0.0001,                         ! convergence: RMS gradient, kcal/mol/Angstrom
+  ntb=1,                               ! periodic boundaries, constant volume
+  cut=9.0,                             ! nonbonded cutoff, Angstrom
+  ntc=1,                               ! no SHAKE during minimization
+  ntf=1,                               ! evaluate all force terms, including bonds to H
+  ntr=1,                               ! turn on positional restraints
+  restraintmask=':1-1117',    ! restrained atoms: cofactor, Mg, protonated Glu (heavy atoms)
+  restraint_wt=10.0,                    ! restraint force constant, kcal/mol/Angstrom^2
+&end

@@ -1,0 +1,35 @@
+source leaprc.protein.ff14SB
+source leaprc.gaff2
+source leaprc.water.tip3p
+loadamberparams	frcmod.ionsjc_tip3p
+loadamberparams frcmod.ions234lm_1264_tip3p
+
+loadamberparams TPP.frcmod
+TPP = loadMol2 TPP.mol2
+
+loadamberparams INO.frcmod
+INO = loadMol2 INO.mol2
+
+loadamberparams ACC.frcmod
+ACC = loadMol2 ACC.mol2
+
+saveamberparm ACC ACC.prmtop ACC.inpcrd
+
+receptor = loadPDB receptor.pdb
+
+receptor_complex = combine {receptor INO}
+
+saveamberparm receptor_complex receptor.prmtop receptor.inpcrd
+
+complex = combine {receptor_complex ACC}
+
+savepdb complex unsolvated_complex.pdb
+saveamberparm complex dry_complex.prmtop dry_complex.inpcrd
+
+solvatebox complex TIP3PBOX 10.0 iso
+addIonsRand complex  Na+ 0
+addIonsRand complex Na+ 226 Cl- 226
+
+saveamberparm complex complex_solvated.prmtop complex_solvated.inpcrd
+
+quit

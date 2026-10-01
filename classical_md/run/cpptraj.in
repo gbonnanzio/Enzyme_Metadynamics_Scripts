@@ -1,0 +1,7 @@
+parm complex_solvated.prmtop
+        trajin mdcrd_equil2.nc lastframe
+        autoimage :1-1117
+        trajout equilibrated_system.pdb
+        go
+        quit
+        

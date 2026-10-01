@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# AMBER topologies / coordinates (large; regenerate with the prep pipeline)
+*.prmtop
+*.inpcrd
+
+# MD trajectories / restarts / checkpoints
+*.nc
+*.rst
+*.traj
+*_trj.xyz
+*.mdcrd
+mdcrd_*
+
+# MD / diagnostic output
+*.mden
+*.mdinfo
+mdinfo
+*.out
+*.log
+*.info
+
+# PLUMED metadynamics outputs
+HILLS
+COLVAR
+grid.dat
+bck.*
+
+# Generated analysis products and job logs
+analysis/
+*.png
+prep.txt
+analysis.txt
+slurm_ids
+
+# Keep the small bundled ligand params under classical_md/prep even though
+# the global *.inpcrd/*.prmtop rules would otherwise ignore them.
+!classical_md/prep/DON.prmtop
+!classical_md/prep/DON.inpcrd

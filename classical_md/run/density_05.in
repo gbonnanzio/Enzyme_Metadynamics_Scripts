@@ -1,0 +1,26 @@
+Density equilibration, NPT
+&cntrl
+  imin=0,                              ! run dynamics
+  irest=1,                             ! continuation: read velocities from the restart
+  ntx=5,                               ! read both coordinates and velocities
+  nstlim=500000,                       ! 200,000 steps = 200 ps at 1 fs
+  dt=0.001,                            ! timestep, ps
+  ntc=2,                               ! SHAKE on bonds to hydrogen
+  ntf=2,                               ! skip forces for constrained bonds
+  ntt=3,                               ! Langevin thermostat
+  gamma_ln=5.0,                        ! collision frequency, 1/ps
+  temp0=300.0,                         ! target temperature, K
+  ntb=2,                               ! periodic boundaries, constant pressure
+  ntp=1,                               ! isotropic position scaling
+  barostat=1,                          ! 1 = Berendsen, 2 = Monte Carlo
+  pres0=1.01325,                       ! target pressure, bar
+  taup=2.0,                            ! pressure relaxation time, ps
+  cut=9.0,                             ! nonbonded cutoff, Angstrom
+  ntr=1,                               ! positional restraints on
+  restraintmask=':1-1117&!@H=',        ! solute heavy atoms
+  restraint_wt=5,                      ! restraint force constant, kcal/mol/Angstrom^2 
+  ntwx=5000,                           ! trajectory frame every 5 ps
+  ntpr=1000,                           ! energies every 1000 steps
+  ntwr=10000,                          ! restart file every 10,000 steps
+  ig=-1,                               ! random seed from the clock
+&end
