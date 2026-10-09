@@ -30,7 +30,7 @@ radii_ino = [                     # DON/INO
 target_angles_ino = [122.6,115.0,121.1]
 # load receptor universe and extract the different parts of the protein int1 receptor 
 
-receptor_and_TPP = mda.Universe(os.path.join(PREP_DIR, '5EJ5', 'AMC_receptor_template_updated.pdb'))
+receptor_and_TPP = mda.Universe(os.path.join(PREP_DIR, '5EJ5', 'AMC_receptor_template.pdb'))
 
 head_dir = '/projects/p30041/gbf4422/5EJ5/MD_Final/AMC/'
 

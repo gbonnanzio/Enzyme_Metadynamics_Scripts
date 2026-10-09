@@ -27,7 +27,7 @@ radii = [                         # DON
 target_angles = [79.9,117.6,117.2]
 
 # load receptor universe and extract the different parts of the protein int1 receptor 
-receptor = mda.Universe(os.path.join(PREP_DIR, '5EJ5', '5EJ5_DMC_receptor_updated.pdb'))
+receptor = mda.Universe(os.path.join(PREP_DIR, '5EJ5', 'DMC_receptor.pdb'))
 
 head_dir = '/projects/p30041/gbf4422/5EJ5/MD_200/DMC/'
 write_universe(f"{head_dir}receptor/receptor.pdb",receptor)
