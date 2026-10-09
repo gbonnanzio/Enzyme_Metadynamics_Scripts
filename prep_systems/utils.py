@@ -1988,430 +1988,16 @@ def add_backbone_terminal_caps(universe, cap_h_dist=1.09,
 # (templated verbatim on 5EJ5/metadynamics/first_half/6/step_1/md_uma_plumed.py
 #  and submit_md_uma_plumed.sh; only the tokenized values are substituted)
 # ---------------------------------------------------------------------------
-_MD_UMA_PLUMED_TEMPLATE = r'''#!/projects/p30041/gbf4422/envs/uma-env/bin/python3
-"""
-Heating -> equilibration -> well-tempered metadynamics with ASE + PLUMED,
-driving the UMA (FAIRChem) potential in-process on the GPU.
-
-This reproduces the ORCA `ExtOpt MD` workflow in md.inp:
-  1. Heat the active region 100 -> 300 K (Langevin thermostat).
-  2. Equilibrate at 300 K.
-  3. Well-tempered metadynamics on the forming C-C bond (C2 of ThDP <-> donor
-     C1, CV_ATOMS below), with lower/upper walls, biasing handled by PLUMED.
-
-The ORCA-frozen atoms are held fixed with FixAtoms; the frozen set is given
-explicitly by FROZEN_ATOMS (0-based) and the active region is its complement.
-
-Every water O is held inside a single flat-bottom containment sphere (loose
-Hookean restraint to the centroid of the frozen atoms), active in all three
-phases, so waters cannot evaporate from the non-periodic cluster. The wall radius
-is uniform — the same for every water, independent of where it sits. walls.log
-records how often the wall engages.
-
-Restart: the metadynamics phase resumes from mtd_restart.traj (latest state
-only, written atomically). On resume, HILLS/COLVAR/logs/trajectories are
-trimmed back to the checkpoint so nothing is double counted.
-
-Requires the PLUMED python backend in uma-env:
-    conda install -p /projects/p30041/gbf4422/envs/uma-env -c conda-forge py-plumed
-"""
-
-import os
-
-import numpy as np
-import MDAnalysis as mda
-from ase import Atoms, units
-from ase.io import read, write
-from ase.io.trajectory import Trajectory
-from ase.constraints import FixAtoms, Hookean
-from ase.md.langevin import Langevin
-from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
-from ase.md import MDLogger
-from ase.calculators.plumed import Plumed
-
-from fairchem.core import pretrained_mlip, FAIRChemCalculator
-
-# ── system ──────────────────────────────────────────────────────────────
-STRUCTURE = "__STRUCTURE__"
-CHARGE, MULT = __CHARGE__, __MULT__
-MODEL, DEVICE = "uma-s-1p2", "cuda"          # in-process UMA on the GPU
-
-# ── dynamics ────────────────────────────────────────────────────────────
-TIMESTEP = 0.5 * units.fs
-FRICTION = 1.0 / (100 * units.fs)            # gentler than 1/50 fs; changes kinetics, not the FES
-T_START, T_HEAT, T_RUN = 100.0, 300.0, 300.0
-
-# Production: 5 ps heat / 10 ps equil / metadynamics target below.
-# N_MTD is the *cumulative* mtd target; raise it and resubmit to extend the run.
-# ~200k mtd steps fit in one 12 h job, so each resubmit adds ~100 ps.
-N_HEAT, N_EQUIL, N_MTD = __NHEAT__, __NEQUIL__, __NMTD__
-# Fast test values were: N_HEAT, N_EQUIL, N_MTD = 2000, 2000, 20000
-DUMP_STRIDE = 100
-MTD_OFFSET = N_HEAT + N_EQUIL                # integrator step at which mtd starts
-
-# ── restart ─────────────────────────────────────────────────────────────
-RESTART_TRAJ = "mtd_restart.traj"            # latest mtd state (positions, momenta, mtd_step)
-CHECKPOINT_EVERY = 1000                      # must be a multiple of PACE and DUMP_STRIDE
-
-# ── energy units: defined in kcal/mol, converted to each consumer's unit at use ─
-# Every energy constant below (HEIGHT, KAPPA_*, TETHER_K) is written in kcal/mol
-# (or kcal/mol/A^2) and multiplied by one of these factors where it is used:
-# PLUMED reads kJ/mol (the UNITS line leaves energy at the PLUMED default), while
-# ASE/Hookean reads eV.
-KCAL_TO_KJ = units.kcal / units.kJ           # kcal/mol -> kJ/mol  (= 4.184)
-KCAL_TO_EV = units.kcal / units.mol          # kcal/mol -> eV      (ASE base energy)
-
-# ── metadynamics (lengths in Angstrom; energies in kcal/mol, converted at use) ──
-CV_ATOMS = (__CV0__, __CV1__)                        # 0-based (first CV distance); +1 for PLUMED
-SIGMA, HEIGHT, PACE = __SIGMA__, __HEIGHT__, __PACE__         # width (A), hill height (kcal/mol)
-BIASFACTOR = __BIASFACTOR__        # ~27.7 from ORCA WellTempered 8000 K (dimensionless)
-WALL_LO, KAPPA_LO = __WALL_LO__, __KAPPA_LO__               # lower wall AT 1.2 A; KAPPA kcal/mol/A^2
-WALL_HI, KAPPA_HI = __WALL_HI__, __KAPPA_HI__               # upper wall; KAPPA kcal/mol/A^2
-GRID_MIN, GRID_MAX, GRID_BIN = __GRID_MIN__, __GRID_MAX__, __GRID_BIN__ # ~0.021 A/bin
-
-# Optional SECOND collective variable (e.g. a proton-transfer O...H distance). When
-# CV2_ATOMS is None the run is 1-D metadynamics over d1 only (unchanged); when it is a
-# (i, j) 0-based pair the run is 2-D well-tempered metadynamics over (d1, d2), each CV
-# getting its own walls/sigma/grid and METAD biasing the joint space.
-CV2_ATOMS = __CV2_ATOMS__
-SIGMA2 = __SIGMA2__                                          # width (A) for d2
-WALL2_LO, KAPPA2_LO = __WALL2_LO__, __KAPPA2_LO__           # d2 lower wall; KAPPA kcal/mol/A^2
-WALL2_HI, KAPPA2_HI = __WALL2_HI__, __KAPPA2_HI__           # d2 upper wall (None = none); kcal/mol/A^2
-GRID2_MIN, GRID2_MAX, GRID2_BIN = __GRID2_MIN__, __GRID2_MAX__, __GRID2_BIN__
-
-# FROZEN ATOMS (0-based) — held fixed with FixAtoms; active region is the complement
-fr_str = "__FR_STR__"
-FROZEN_ATOMS = [int(i) for i in fr_str.split()]
-
-# ── water containment (flat-bottom spherical wall, ASE Hookean, every phase) ──
-# A single containment sphere centered on the frozen-atom centroid: every water O
-# is free inside the wall radius R and feels E = 0.5*k*(r - R)^2 outside it. R is
-# the SAME for every water (it does not depend on where a given water sits), so the
-# restraint is uniform across the droplet. By default R is sized once to clear the
-# outermost initial water O by CONTAIN_MARGIN; set CONTAIN_RADIUS to pin an absolute
-# radius instead (None = auto-size).
-EXPECTED_WATERS = __EXPECTED_WATERS__
-CONTAIN_MARGIN = 5.0    # A of head-room past the outermost initial water O (auto-size)
-CONTAIN_RADIUS = None   # A; if set, an absolute wall radius used for every water
-TETHER_K = 10.0         # kcal/mol/A^2 (soft: 1 A past the wall = 5 kcal/mol ~8 kT)
-
-# Any extra PLUMED lines (appended to the input). Empty by default.
-EXTRA_PLUMED_LINES = []
+# The metadynamics driver lives in a standalone template file next to this
+# module (md_uma_plumed_template.py), read at write time; its __TOKEN__
+# placeholders are substituted in write_md_uma_plumed().
+_MD_UMA_PLUMED_TEMPLATE_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "md_uma_plumed_template.py")
 
 
-# ── helpers ─────────────────────────────────────────────────────────────
-def write_plain_xyz(path, atoms, idx=None, with_energy=False):
-    """Append one XYZ frame. idx selects a subset of atoms (no Atoms slicing,
-    so constraints are never copied). The energy comment is written only if
-    already cached on the calculator — never triggers a fresh evaluation."""
-    comment = ""
-    if with_energy and atoms.calc is not None:
-        try:
-            if not atoms.calc.calculation_required(atoms, ["energy"]):
-                comment = f"energy={atoms.get_potential_energy():.8f}"
-        except Exception:
-            comment = ""
-    symbols = atoms.get_chemical_symbols()
-    positions = atoms.get_positions()
-    if idx is not None:
-        symbols = [symbols[i] for i in idx]
-        positions = positions[idx]
-    with open(path, "a") as f:
-        f.write(f"{len(symbols)}\n{comment}\n")
-        for s, (x, y, z) in zip(symbols, positions):
-            f.write(f"{s:<2s} {x:18.8f} {y:18.8f} {z:18.8f}\n")
-
-
-def find_water_oxygens(structure=STRUCTURE):
-    """0-based indices of each water oxygen, read straight from the topology:
-    every residue named WAT contributes its oxygen. Selecting by residue name is
-    robust to O-H geometry (a stretched or transferred proton never changes the
-    count), unlike bond-counting. MDAnalysis reads the PDB in file order, so these
-    indices line up 1:1 with the ASE Atoms built from the same file."""
-    u = mda.Universe(structure)
-    water_O = u.select_atoms("resname WAT and name O*")
-    return water_O.indices.tolist()
-
-
-def build_plumed_lines():
-    c1, c2 = CV_ATOMS[0] + 1, CV_ATOMS[1] + 1          # 0-based -> PLUMED 1-based
-    # kcal/mol -> kJ/mol for the PLUMED input (energy left at the PLUMED default)
-    height_kj = HEIGHT * KCAL_TO_KJ
-    klo_kj, khi_kj = KAPPA_LO * KCAL_TO_KJ, KAPPA_HI * KCAL_TO_KJ
-    lines = [
-        "UNITS LENGTH=A TIME=fs",   # energy left as PLUMED default kJ/mol
-        f"d1: DISTANCE ATOMS={c1},{c2}",
-        f"LOWER_WALLS ARG=d1 AT={WALL_LO} KAPPA={klo_kj:g}",
-        f"UPPER_WALLS ARG=d1 AT={WALL_HI} KAPPA={khi_kj:g}",
-    ]
-    if CV2_ATOMS is None:
-        metad_arg, sigma_arg = "d1", f"{SIGMA}"
-        grid_min, grid_max, grid_bin = f"{GRID_MIN}", f"{GRID_MAX}", f"{GRID_BIN}"
-        print_arg = "d1,metad.bias"
-    else:
-        e1, e2 = CV2_ATOMS[0] + 1, CV2_ATOMS[1] + 1    # 0-based -> PLUMED 1-based
-        k2lo_kj = KAPPA2_LO * KCAL_TO_KJ
-        lines += [
-            f"d2: DISTANCE ATOMS={e1},{e2}",
-            f"LOWER_WALLS ARG=d2 AT={WALL2_LO} KAPPA={k2lo_kj:g}",
-        ]
-        # d2 (e.g. an O...H proton transfer) rides on the same two fragments as d1, so a
-        # tight d2 upper wall also tethers the fragments together and caps the C-C
-        # distance d1. WALL2_HI is therefore optional (None = no upper wall); when set it
-        # should sit well above the reactant d2 so it only bounds dissociation, not the
-        # reaction. GRID2_MAX must still cover every value d2 can reach.
-        if WALL2_HI is not None:
-            k2hi_kj = KAPPA2_HI * KCAL_TO_KJ
-            lines.append(f"UPPER_WALLS ARG=d2 AT={WALL2_HI} KAPPA={k2hi_kj:g}")
-        metad_arg, sigma_arg = "d1,d2", f"{SIGMA},{SIGMA2}"
-        grid_min = f"{GRID_MIN},{GRID2_MIN}"
-        grid_max = f"{GRID_MAX},{GRID2_MAX}"
-        grid_bin = f"{GRID_BIN},{GRID2_BIN}"
-        print_arg = "d1,d2,metad.bias"
-    lines += [
-        (f"metad: METAD ARG={metad_arg} SIGMA={sigma_arg} HEIGHT={height_kj:g} PACE={PACE} "
-         f"BIASFACTOR={BIASFACTOR} TEMP={T_RUN} "
-         f"GRID_MIN={grid_min} GRID_MAX={grid_max} GRID_BIN={grid_bin} "
-         f"GRID_WSTRIDE=1000 GRID_WFILE=grid.dat CALC_RCT FILE=HILLS"),
-        f"PRINT ARG={print_arg} STRIDE={DUMP_STRIDE} FILE=COLVAR",
-        f"FLUSH STRIDE={DUMP_STRIDE}",
-    ]
-    return lines + EXTRA_PLUMED_LINES
-
-
-def write_checkpoint(atoms, mtd_step):
-    """Latest state only, written to a temp file and renamed so a kill mid-write
-    never leaves a corrupt checkpoint."""
-    snap = Atoms(numbers=atoms.get_atomic_numbers(),
-                 positions=atoms.get_positions(),
-                 momenta=atoms.get_momenta())
-    snap.info["mtd_step"] = int(mtd_step)
-    tmp = RESTART_TRAJ + ".tmp"
-    with Trajectory(tmp, "w") as t:
-        t.write(snap)
-    os.replace(tmp, RESTART_TRAJ)
-
-
-def read_checkpoint():
-    if not os.path.exists(RESTART_TRAJ):
-        return None
-    with Trajectory(RESTART_TRAJ) as t:
-        if len(t) == 0:
-            return None
-        snap = t[-1]
-    if "mtd_step" not in snap.info:
-        raise RuntimeError(
-            f"{RESTART_TRAJ} has no mtd_step (written by an older version of "
-            "this script, whose step count is unreliable). Move it and the mtd "
-            "outputs (HILLS, COLVAR, *_mtd_trj.xyz) aside and start over.")
-    return snap
-
-
-def keep_rows_upto(path, limit):
-    """Drop numeric rows whose first column exceeds `limit`; keep comments/headers."""
-    if not os.path.exists(path):
-        return
-    kept = []
-    with open(path) as f:
-        for line in f:
-            s = line.split()
-            try:
-                if s and not line.startswith("#") and float(s[0]) > limit:
-                    continue
-            except ValueError:
-                pass
-            kept.append(line)
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        f.writelines(kept)
-    os.replace(tmp, path)
-
-
-def truncate_xyz(path, n_frames, n_per_frame):
-    """Keep the first n_frames frames of a plain XYZ file."""
-    if not os.path.exists(path):
-        return
-    n_lines = n_frames * (n_per_frame + 2)
-    with open(path, "rb+") as f:
-        for _ in range(n_lines):
-            if not f.readline():
-                return            # shorter than expected: leave it alone
-        f.truncate(f.tell())
-
-
-def main():
-    assert CHECKPOINT_EVERY % PACE == 0 and CHECKPOINT_EVERY % DUMP_STRIDE == 0
-    assert MTD_OFFSET % CHECKPOINT_EVERY == 0 and MTD_OFFSET % DUMP_STRIDE == 0
-
-    atoms = read(STRUCTURE)
-    n_atoms = len(atoms)
-    # UMA omol is molecular: no PBC, no cell
-    atoms.set_pbc(False)
-    atoms.set_cell([0.0, 0.0, 0.0])
-    atoms.info["charge"] = CHARGE
-    atoms.info["spin"] = MULT
-    # Drop PDB-derived per-atom arrays so trajectory .xyz stays clean
-    for key in ("occupancy", "bfactor", "residuenames",
-                "atomtypes", "residuenumbers"):
-        if key in atoms.arrays:
-            del atoms.arrays[key]
-
-    if DEVICE == "cuda":
-        import torch
-        if not torch.cuda.is_available():
-            raise RuntimeError(
-                "DEVICE='cuda' but torch.cuda.is_available() is False — "
-                "no GPU visible (check the SLURM --gres request)."
-            )
-        print(f"UMA on GPU: {torch.cuda.get_device_name(0)}", flush=True)
-
-    # Active/frozen partition (0-based indices, no shift).
-    frozen_idx = sorted(set(FROZEN_ATOMS))
-    active_idx = sorted(set(range(n_atoms)) - set(frozen_idx))
-    cv_all = set(CV_ATOMS) | (set(CV2_ATOMS) if CV2_ATOMS is not None else set())
-    if cv_all & set(frozen_idx):
-        raise RuntimeError("a CV atom is in FROZEN_ATOMS")
-    print(f"active={len(active_idx)} frozen={len(frozen_idx)} atoms", flush=True)
-
-    # ── water tethers: WAT oxygens read from the input PDB, so identical on restart
-    water_O = find_water_oxygens(STRUCTURE)
-    if len(water_O) != EXPECTED_WATERS:
-        raise RuntimeError(f"found {len(water_O)} WAT oxygens, expected {EXPECTED_WATERS} "
-                           "(check the WAT residue count in the input PDB)")
-    pos0 = atoms.get_positions()
-    center = pos0[frozen_idx].mean(axis=0)
-    r0 = np.linalg.norm(pos0[water_O] - center, axis=1)
-    R = float(CONTAIN_RADIUS) if CONTAIN_RADIUS is not None else float(r0.max()) + CONTAIN_MARGIN
-    if r0.max() > R:
-        raise RuntimeError(f"CONTAIN_RADIUS={R} A sits inside the outermost initial "
-                           f"water O at {r0.max():.2f} A; raise it or use auto-size.")
-    print(f"containing {len(water_O)} waters within R={R:.2f} A of the frozen centroid "
-          f"(uniform wall, k={TETHER_K} eV/A^2; outermost initial water at "
-          f"{r0.max():.2f} A)", flush=True)
-
-    predictor = pretrained_mlip.get_predict_unit(MODEL, device=DEVICE, inference_settings="turbo")
-    base_calc = FAIRChemCalculator(predictor, task_name="omol")
-    atoms.calc = base_calc
-
-    # Constraints BEFORE assigning velocities so FixAtoms zeros frozen momenta.
-    cons = [FixAtoms(indices=frozen_idx)]
-    cons += [Hookean(a1=int(o), a2=center.copy(), k=TETHER_K * KCAL_TO_EV, rt=R)
-             for o in water_O]
-    atoms.set_constraint(cons)
-
-    snap = read_checkpoint()
-    resume = snap is not None
-    if not resume:
-        # fresh start: move dumps from any earlier attempt aside (they're appended to)
-        for p in ("all_heat_trj.xyz", "active_heat_trj.xyz",
-                  "all_equil_trj.xyz", "active_equil_trj.xyz",
-                  "all_mtd_trj.xyz", "active_mtd_trj.xyz", "walls.log"):
-            if os.path.exists(p):
-                os.replace(p, f"bck.{p}")
-
-    # Langevin: per-atom coupling handles the frozen DOF; no COM removal, since
-    # with atoms pinned the centre of mass is not a conserved quantity.
-    dyn = Langevin(atoms, TIMESTEP, temperature_K=T_RUN, friction=FRICTION,
-                   fixcm=False)
-
-    if resume:
-        # Trim everything written after the checkpoint BEFORE opening the logs.
-        done_mtd = int(snap.info["mtd_step"])
-        dt_fs = TIMESTEP / units.fs
-        step_ckpt = MTD_OFFSET + done_mtd
-        # PLUMED re-deposits/re-prints at the checkpoint step itself, so drop it
-        for fn in ("HILLS", "COLVAR"):
-            keep_rows_upto(fn, done_mtd * dt_fs - 0.5 * dt_fs)
-        keep_rows_upto("md.log", step_ckpt * dt_fs / 1000.0 + 0.25 * dt_fs / 1000.0)
-        keep_rows_upto("walls.log", step_ckpt + 0.5)
-        n_frames = done_mtd // DUMP_STRIDE
-        truncate_xyz("all_mtd_trj.xyz", n_frames, n_atoms)
-        truncate_xyz("active_mtd_trj.xyz", n_frames, len(active_idx))
-
-    # Instantaneous T (mobile DOF, accounts for FixAtoms) + energies -> md.log
-    mdlog = MDLogger(dyn, atoms, "md.log", header=not resume, stress=False,
-                     peratom=False, mode="a" if resume else "w")
-
-    # Tether diagnostics -> walls.log
-    wall_f = open("walls.log", "a" if resume else "w")
-    if not resume:
-        d2_hdr = "  d2(A)" if CV2_ATOMS is not None else ""
-        wall_f.write(f"# step  d1(A){d2_hdr}  n_beyond_wall  max_overshoot(A)  "
-                     f"E_tether(kcal/mol)\n")
-    c1, c2 = CV_ATOMS
-
-    def log_walls():
-        p = atoms.positions
-        over = np.linalg.norm(p[water_O] - center, axis=1) - R
-        act = over > 0
-        e = 0.5 * TETHER_K * np.sum(over[act] ** 2)
-        d1 = np.linalg.norm(p[c1] - p[c2])
-        d2_col = f" {np.linalg.norm(p[CV2_ATOMS[0]] - p[CV2_ATOMS[1]]):8.4f}" \
-            if CV2_ATOMS is not None else ""
-        wall_f.write(f"{dyn.nsteps:10d} {d1:8.4f}{d2_col} {int(act.sum()):4d} "
-                     f"{max(over.max(), 0.0):8.3f} {e:12.6f}\n")
-        wall_f.flush()
-
-    def attach_phase(all_path, active_path):
-        dyn.observers.clear()
-        dyn.attach(lambda: write_plain_xyz(all_path, atoms, with_energy=True),
-                   interval=DUMP_STRIDE)
-        dyn.attach(lambda: write_plain_xyz(active_path, atoms, idx=active_idx),
-                   interval=DUMP_STRIDE)
-        dyn.attach(mdlog, interval=DUMP_STRIDE)
-        dyn.attach(log_walls, interval=DUMP_STRIDE)
-
-    if not resume:
-        MaxwellBoltzmannDistribution(atoms, temperature_K=T_START)
-        dyn.set_temperature(temperature_K=T_START)
-
-        # ── Phase 1: heat 100 -> 300 K ──────────────────────────────────
-        def ramp():
-            frac = min(dyn.nsteps / N_HEAT, 1.0)
-            dyn.set_temperature(temperature_K=T_START + (T_HEAT - T_START) * frac)
-
-        attach_phase("all_heat_trj.xyz", "active_heat_trj.xyz")
-        dyn.attach(ramp, interval=1)
-        print("heating...", flush=True)
-        dyn.run(N_HEAT)
-
-        # ── Phase 2: equilibrate at 300 K ───────────────────────────────
-        dyn.set_temperature(temperature_K=T_RUN)
-        attach_phase("all_equil_trj.xyz", "active_equil_trj.xyz")
-        print("equilibrating...", flush=True)
-        dyn.run(N_EQUIL)
-        done_mtd = 0
-    else:
-        atoms.set_positions(snap.get_positions())
-        atoms.set_momenta(snap.get_momenta())
-        # Continue the integrator's step counter: keeps observer intervals aligned
-        # and suppresses ASE's step-0 observer call (no duplicate frames/checkpoint).
-        dyn.nsteps = MTD_OFFSET + done_mtd
-        print(f"resuming metadynamics from step {done_mtd}/{N_MTD}", flush=True)
-
-    # ── Phase 3: well-tempered metadynamics ─────────────────────────────
-    # restart=True makes PLUMED read HILLS back and append; istep keeps the
-    # PACE/output counters continuous.
-    atoms.calc = Plumed(calc=base_calc, input=build_plumed_lines(),
-                        timestep=TIMESTEP, atoms=atoms,
-                        kT=units.kB * T_RUN, log="plumed.log", restart=resume)
-    atoms.calc.istep = done_mtd
-    attach_phase("all_mtd_trj.xyz", "active_mtd_trj.xyz")
-    dyn.attach(lambda: write_checkpoint(atoms, dyn.nsteps - MTD_OFFSET),
-               interval=CHECKPOINT_EVERY)
-    print("metadynamics...", flush=True)
-    dyn.run(max(0, N_MTD - done_mtd))
-    wall_f.close()
-
-    # Final snapshot back into a PDB (preserves residue/atom names)
-    template = read(STRUCTURE)
-    template.set_positions(atoms.get_positions())
-    write("md_final.pdb", template)
-    print("done", flush=True)
-
-
-if __name__ == "__main__":
-    main()'''
+def _load_md_uma_plumed_template():
+    with open(_MD_UMA_PLUMED_TEMPLATE_FILE) as f:
+        return f.read()
 
 
 _SUBMIT_MD_UMA_PLUMED_TEMPLATE = r'''#!/bin/bash
@@ -2423,6 +2009,7 @@ _SUBMIT_MD_UMA_PLUMED_TEMPLATE = r'''#!/bin/bash
 #SBATCH --exclude=qgpu2005,qgpu2006
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=4
 #SBATCH --mem-per-cpu=10G
 #SBATCH --job-name=__JOB_NAME__
 #SBATCH --output=%x_%j.out
@@ -2436,8 +2023,8 @@ _SUBMIT_MD_UMA_PLUMED_TEMPLATE = r'''#!/bin/bash
 source ~/.bashrc
 ulimit -s unlimited
 
-export OMP_NUM_THREADS=${SLURM_NTASKS}
-export MKL_NUM_THREADS=${SLURM_NTASKS}
+export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
+export MKL_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 
 UMA_PYTHON=/projects/p30041/gbf4422/envs/uma-env/bin/python3
 
@@ -2446,17 +2033,19 @@ UMA_PYTHON=/projects/p30041/gbf4422/envs/uma-env/bin/python3
 
 
 def write_md_uma_plumed(output_dir, charge, mult, cv_atoms, frozen_atoms,
-                        expected_waters,
                         structure="protonated_cluster.pdb",
+                        ca_restraint_atoms=(), ca_restraint_k=2.0,
                         n_heat=10000, n_equil=20000, n_mtd=2000000,
                         sigma=0.1, height=0.5, pace=50,
-                        biasfactor="(300.0 + 8000.0) / 300.0",
+                        biasfactor=27.6667,  # (T + deltaT_bias) / T = (300 + 8000) / 300
                         wall_lo=1.2, kappa_lo=50.0, wall_hi=6.5, kappa_hi=100.0,
                         grid_min=0.8, grid_max=8.5, grid_bin=360,
-                        cv2_atoms=None,
-                        sigma2=0.1, wall2_lo=0.85, kappa2_lo=50.0,
-                        wall2_hi=5.5, kappa2_hi=50.0,
-                        grid2_min=0.7, grid2_max=6.0, grid2_bin=265):
+                        cv2_pt=None,
+                        sigma2=0.05, wall2_lo=-4.5, kappa2_lo=100.0,
+                        wall2_hi=2.0, kappa2_hi=100.0,
+                        grid2_min=-6.0, grid2_max=3.5, grid2_bin=474,
+                        no_wall_hi=5.5, no_kappa=100.0,
+                        seed=None):
     """Write an ASE+PLUMED+UMA well-tempered metadynamics driver (md_uma_plumed.py)
     into output_dir, templated verbatim on the reference step_1 driver. Only the
     per-run values are substituted; MtD scalars default to the reference step_1
@@ -2467,21 +2056,35 @@ def write_md_uma_plumed(output_dir, charge, mult, cv_atoms, frozen_atoms,
     at the point of use.
 
     cv_atoms : (int, int) — 0-based indices of the two atoms whose distance is the CV.
-    cv2_atoms : (int, int) | None — if given, a SECOND distance CV (0-based pair); the run
-        becomes 2-D well-tempered metadynamics over (d1, d2), each CV getting its own
-        walls (wall2_*/kappa2_*), sigma (sigma2) and grid (grid2_*). None (the default)
-        leaves the emitted driver byte-for-byte a 1-D run over d1 only.
+    cv2_pt : (int, int, int) | None — if given, a SECOND CV that is a PROTON-TRANSFER
+        coordinate cv2 = d(N,H) - d(O,H) built from three 0-based atom indices (N = proton
+        donor, O = proton acceptor, H = the transferring proton). cv2 is negative with H on N
+        (reactant), ~0 at the shared TS, positive with H on O (product). The run becomes 2-D
+        over (d1, cv2); cv2 gets its own walls (wall2_*/kappa2_*, in cv2 units, e.g. -4.5/+2.0),
+        sigma (sigma2) and grid (grid2_*, which must span those walls). A d(N,O) UPPER wall at
+        ``no_wall_hi`` (KAPPA ``no_kappa`` kcal/mol/A^2) keeps the proton near its donor/acceptor
+        pair so cv2 stays well-defined. All walls are labeled and their bias (plus metad.bias)
+        is printed to COLVAR alongside d1, cv2, dNO. None (the default) leaves the emitted
+        driver a 1-D run over d1 only.
+    no_wall_hi, no_kappa : d(N,O) upper-wall position (A) and force constant (kcal/mol/A^2),
+        used only in the ``cv2_pt`` path.
     frozen_atoms : iterable[int] — 0-based indices held fixed (fragment 2).
-    expected_waters : int — number of neutral waters (O bonded to exactly two H) in
-        ``structure``; the driver tethers each to a fixed point and asserts this
-        count at startup. Compute it from the run structure (count WAT residues).
+    ca_restraint_atoms : iterable[int] — 0-based indices kept mobile but harmonically
+        tethered to their initial positions (soft positional restraint), with force
+        constant ``ca_restraint_k`` (kcal/mol/A^2). Empty by default (no restraints).
+    seed : int | None — seeds the driver's RNG (numpy Generator), used for the initial
+        MaxwellBoltzmannDistribution velocities and the Langevin thermostat noise, so the
+        run is reproducible. None (the default) leaves it unseeded.
 
     Water containment is handled in-driver by flat-bottom Hookean tethers on every
     water O (active in all phases), so no PLUMED solvent wall is emitted.
     """
     cv0, cv1 = cv_atoms
     fr_str = " ".join(str(int(i)) for i in frozen_atoms)
-    text = _MD_UMA_PLUMED_TEMPLATE
+    car_str = " ".join(str(int(i)) for i in ca_restraint_atoms)
+    expected_waters = mda.Universe(os.path.join(output_dir, structure)).select_atoms(
+        "resname WAT and name O").n_atoms
+    text = _load_md_uma_plumed_template()
     for token, value in (
         ("__STRUCTURE__", structure),
         ("__CHARGE__", str(charge)),
@@ -2502,9 +2105,11 @@ def write_md_uma_plumed(output_dir, charge, mult, cv_atoms, frozen_atoms,
         ("__GRID_MIN__", str(grid_min)),
         ("__GRID_MAX__", str(grid_max)),
         ("__GRID_BIN__", str(grid_bin)),
-        ("__CV2_ATOMS__",
-         "None" if cv2_atoms is None
-         else f"({int(cv2_atoms[0])}, {int(cv2_atoms[1])})"),
+        ("__CV2_PT__",
+         "None" if cv2_pt is None
+         else f"({int(cv2_pt[0])}, {int(cv2_pt[1])}, {int(cv2_pt[2])})"),
+        ("__NO_WALL_HI__", str(no_wall_hi)),
+        ("__NO_KAPPA__", str(no_kappa)),
         ("__SIGMA2__", str(sigma2)),
         ("__WALL2_LO__", str(wall2_lo)),
         ("__KAPPA2_LO__", str(kappa2_lo)),
@@ -2514,7 +2119,10 @@ def write_md_uma_plumed(output_dir, charge, mult, cv_atoms, frozen_atoms,
         ("__GRID2_MAX__", str(grid2_max)),
         ("__GRID2_BIN__", str(grid2_bin)),
         ("__FR_STR__", fr_str),
+        ("__CA_RESTRAINT_STR__", car_str),
+        ("__CA_RESTRAINT_K__", str(ca_restraint_k)),
         ("__EXPECTED_WATERS__", str(int(expected_waters))),
+        ("__SEED__", str(int(seed)) if seed is not None else "None"),
     ):
         text = text.replace(token, value)
     os.makedirs(output_dir, exist_ok=True)

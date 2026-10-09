@@ -29,7 +29,7 @@ target_angles = [79.9,117.6,117.2]
 # load receptor universe and extract the different parts of the protein int1 receptor 
 receptor = mda.Universe(os.path.join(PREP_DIR, '5EJ5', '5EJ5_DMC_receptor_updated.pdb'))
 
-head_dir = '/projects/p30041/gbf4422/5EJ5/MD_Final/DMC/'
+head_dir = '/projects/p30041/gbf4422/5EJ5/MD_200/DMC/'
 write_universe(f"{head_dir}receptor/receptor.pdb",receptor)
 edit_protein_files(f"{head_dir}receptor/receptor.pdb",extra_resnames=["TPP","MG"])
 
@@ -69,7 +69,7 @@ guess_C2 = C1_coords + unit_vector * radii[0][0] # C2-C1 distance based on DMC t
 # read in each of the substrate files
 directory = os.path.join(PREP_DIR, 'substrates_initial') + '/'
 #file_names = [f for f in os.listdir(directory)]
-file_names = [str(i)+'.pdb' for i in [0,11]]
+file_names = [str(i)+'.pdb' for i in [4,6,11,16]]
 clash_threshold = 1.5
 
 for curr_file_name in file_names:

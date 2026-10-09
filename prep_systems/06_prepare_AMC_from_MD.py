@@ -28,7 +28,7 @@ warnings.filterwarnings("ignore", category=UserWarning, module="MDAnalysis")
 # ---------------------------------------------------------------------------
 # CONFIG — set once (mirrors the relevant subset of Second_Half_Full_Run.py)
 # ---------------------------------------------------------------------------
-R_FIXED = 5  # distance from ACC/INO/MG where protein residues are included (matches stage 12)
+R_FIXED = 5  # distance from ACC/INO/MG where protein residues are included (matches stage 05)
 R_FREE = 5   # distance from ACC/INO/MG where residues (and waters, in WATER_FREE_MODE
              # "distance") are active
 # --- water handling: two independent controls ------------------------------
@@ -96,16 +96,17 @@ SUBSTRATES = [6]  # homo-coupled donor==acceptor substrates to prep
 
 # --- step_3 metadynamics run generation (fills the old "backend" stub) -------
 # In this pipeline the AMC "calc" is a well-tempered metadynamics run, not a
-# stationary opt. After building the cluster, stage 13 writes the metadynamics
+# stationary opt. After building the cluster, stage 06 writes the metadynamics
 # driver (md_uma_plumed.py + submit script) into the SAME prep directory
 # (output_dir), templated on 5EJ5/metadynamics/second_half/6/step_3/, with
 # CHARGE/MULT/FROZEN_ATOMS/CV_ATOMS wired in from the prep.
 WRITE_METADYNAMICS = True
 FORCE_OVERWRITE_RUN = False  # if False, skip a run dir that already has a HILLS file
-# Optional SECOND collective variable for the AMC step: the proton-transfer distance
-# between the acceptor's carbonyl oxygen (ACC "O1") and the proton on INO's hydroxyl
-# (INO "H1"). With this on, step_3 is 2-D well-tempered metadynamics over (forming C-C
-# bond, O...H proton transfer); off, it is the 1-D C-C run (identical to stage 03).
+# Optional SECOND collective variable for the AMC step: the proton transfer from INO's
+# hydroxyl to the acceptor's carbonyl oxygen (ACC "O1"), as the three-atom coordinate
+# cv2 = d(N,H) - d(O,H) (N=INO hydroxyl O, O=ACC "O1", H=INO "H1"). With this on, step_3 is
+# 2-D well-tempered metadynamics over (forming C-C bond, proton transfer); off, it is the
+# 1-D C-C run (identical to stage 03).
 INCLUDE_PROTON_CV = True
 
 # ---------------------------------------------------------------------------
@@ -125,7 +126,7 @@ RESIDUE_CHARGE_DICT = {
 
 
 # ---------------------------------------------------------------------------
-# residue-set loading (from the 12 CSV) + H-bond partner augmentation
+# residue-set loading (from the 05 CSV) + H-bond partner augmentation
 # ---------------------------------------------------------------------------
 def _load_residue_sets():
     """CLUSTER_RESIDS build the QM region; FREE_RESIDS are allowed to move; FIXED_RESIDS
@@ -210,7 +211,7 @@ def _cluster_water_selection():
 
 
 def _free_water_resids(universe, working_dir, build=False):
-    """Resids of the waters allowed to move, defined ONCE at stage 13 (build=True) and
+    """Resids of the waters allowed to move, defined ONCE at stage 06 (build=True) and
     persisted to ``{working_dir}free_water_resids.dat`` so later stages reuse it verbatim.
 
     Which waters are free is set by WATER_FREE_MODE ("all"/"none"/"distance"). Stage 13
@@ -225,7 +226,7 @@ def _free_water_resids(universe, working_dir, build=False):
                 return [int(x) for x in f.read().split()]
         raise FileNotFoundError(
             f"canonical free-water list not found: {path}\n"
-            f"It is built once at stage 13; run stage 13 for this substrate/head-dir "
+            f"It is built once at stage 06; run stage 06 for this substrate/head-dir "
             f"before any later stage.")
     if WATER_FREE_MODE == "none":
         free_wat = universe.atoms[0:0]
@@ -300,7 +301,7 @@ def _write_active_region(universe, frozen_indices, output_dir, label):
 
 
 # ---------------------------------------------------------------------------
-# STAGE 13 — AMC cluster-model prep from the MD frame (prep-only)
+# STAGE 06 — AMC cluster-model prep from the MD frame (prep-only)
 # ---------------------------------------------------------------------------
 def prep_amc(substrate):
     intermediate = INTERMEDIATE
@@ -322,7 +323,7 @@ def prep_amc(substrate):
     charge_dict[SUBSTRATE] = ACC_BASE_CHARGE + acceptor_extra
     charge_dict[INTERMEDIATE] = INO_BASE_CHARGE + donor_extra
 
-    # the QM region is the whole CLUSTER set from the CSV (stage 12) plus the cofactors and
+    # the QM region is the whole CLUSTER set from the CSV (stage 05) plus the cofactors and
     # the waters chosen by WATER_SELECTION_MODE / R_WATER_SELECTION. Which of those waters are
     # frozen vs. mobile is a separate control (WATER_FREE_MODE); _fixed_shell_indices freezes
     # the frozen ones.
@@ -424,31 +425,29 @@ def prep_amc(substrate):
         acc_c_index = int(acc_u[acc_indexes["C2"]].index)
         cv_atoms = (ino_c_index, acc_c_index)
 
-        # optional second CV: the O...H proton transfer from INO's hydroxyl (INO "H1")
-        # to the acceptor carbonyl oxygen (ACC "O1"), driven alongside the C-C bond.
-        cv2_atoms = None
+        # optional second CV: the proton transfer from INO's hydroxyl to the acceptor
+        # carbonyl oxygen, driven alongside the C-C bond. Three-atom coordinate
+        # cv2 = d(N,H) - d(O,H) with N=INO hydroxyl O (donor, where H sits), O=ACC "O1"
+        # (acceptor), H=INO "H1" (the transferring proton). cv2<0 reactant (H on INO),
+        # ~0 TS, cv2>0 product (H on ACC).
+        cv2_pt = None
         if INCLUDE_PROTON_CV:
+            ino_o_index = int(ino_u[ino_indexes["O1"]].index)
             acc_o_index = int(acc_u[acc_indexes["O1"]].index)
             ino_h_index = int(ino_u[ino_indexes["H1"]].index)
-            cv2_atoms = (acc_o_index, ino_h_index)
-
-        # neutral-water count for the driver's tether guard (WAT = O/H1/H2, so one
-        # O per water residue); the driver tethers each water O and asserts this count.
-        expected_waters = final_cluster_universe.select_atoms(
-            "resname WAT and name O").n_atoms
+            cv2_pt = (ino_o_index, acc_o_index, ino_h_index)
 
         if os.path.exists(os.path.join(output_dir, "HILLS")) and not FORCE_OVERWRITE_RUN:
             print(f"[mtd] {output_dir} already has a HILLS file — skipping generation "
                   f"(set FORCE_OVERWRITE_RUN=True to regenerate).")
         else:
             write_md_uma_plumed(output_dir, charge=total_qm_charge, mult=1,
-                                cv_atoms=cv_atoms, cv2_atoms=cv2_atoms,
+                                cv_atoms=cv_atoms, cv2_pt=cv2_pt,
                                 frozen_atoms=frozen_indices,
-                                expected_waters=expected_waters,
                                 structure=run_structure)
             write_md_submit_script(output_dir, job_name=f"{substrate}-S3")
             print(f"[mtd] substrate {substrate}: run dir {output_dir}, CV atoms "
-                  f"{cv_atoms}" + (f" + proton CV {cv2_atoms}" if cv2_atoms else "")
+                  f"{cv_atoms}" + (f" + proton CV {cv2_pt}" if cv2_pt else "")
                   + f", charge {total_qm_charge}, frozen {len(frozen_indices)}")
 
 
