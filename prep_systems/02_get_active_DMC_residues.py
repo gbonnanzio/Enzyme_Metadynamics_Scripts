@@ -17,6 +17,9 @@ from utils import *
 # Suppress warnings specific to MDAnalysis
 warnings.filterwarnings("ignore", category=UserWarning, module="MDAnalysis")
 
+# path specific to this cluster
+SYSTEM_PATH = "/projects/p30041/gbf4422/"
+
 # Directory holding this script and its bundled helper scripts (scripts/).
 PREP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -42,8 +45,8 @@ if MIN_ENERGY_FRAME and MIN_RMSD_FRAME:
     raise ValueError("MIN_ENERGY_FRAME and MIN_RMSD_FRAME are mutually exclusive - set at most one to True")
 
 # where we will read and write files to/from
-HEAD_DIR = '/projects/p30041/gbf4422/5EJ5/MD_200/DMC/'
-OUTPUT_DIR = f"/projects/p30041/gbf4422/Generate_QMMM_Geometries/5EJ5/Metadynamics_Clusters/First_Half_Active_Residues/R_Fixed_0{R_FIXED}/"
+HEAD_DIR = f"{SYSTEM_PATH}5EJ5/MD_200/DMC/"
+OUTPUT_DIR = f"./5EJ5/Cluster_Sizes/First_Half/R_Fixed_0{R_FIXED}/"
 SUBSTRATES_TO_PROCESS = [6]
 
 # H-bond-partner augmentation: pull residues that H-bond into the pocket (e.g. a sidechain

@@ -22,6 +22,9 @@ from utils import *  # write_universe, edit_protein_files, get_substrate_aka_ind
 
 warnings.filterwarnings("ignore", category=UserWarning, module="MDAnalysis")
 
+# path specific to this cluster
+SYSTEM_PATH = "/projects/p30041/gbf4422/"
+
 # ---------------------------------------------------------------------------
 # CONFIG — set once (mirrors the relevant subset of DMC_Full_Run.py)
 # ---------------------------------------------------------------------------
@@ -63,13 +66,13 @@ SOLVATION_CENTER = "solute"      # droplet only: "solute" (whole-cluster centroi
 SOLVATION_CLASH = 2.4            # Ang; drop lattice waters whose O is within this of any solute atom
 WATER_DENSITY = 0.0333           # waters / Ang^3 (bulk ~1 per 29.9 Ang^3); sets lattice spacing
 
-HEAD_DIR = "/projects/p30041/gbf4422/5EJ5/Metadynamics_Sensitivity/collective_variables/one_cv/"          # output root
-MD_HEAD_DIR = "/projects/p30041/gbf4422/5EJ5/MD_200/DMC/"  # trimmed frames read here
+HEAD_DIR = f"{SYSTEM_PATH}5EJ5/Metadynamics/First_Half/"          # output root
+MD_HEAD_DIR = f"{SYSTEM_PATH}5EJ5/MD_200/DMC/"  # trimmed frames read here
 ACTIVE_RESIDUES_FILEPATH = (
-    f"/projects/p30041/gbf4422/Generate_QMMM_Geometries/5EJ5/Metadynamics_Clusters/First_Half_Active_Residues/"
+    f"./5EJ5/Cluster_Sizes/First_Half/"
     f"R_Fixed_0{R_FIXED}/DMC_rfixed_{R_FIXED}_rfree_{R_FREE}_active_residues.csv")
 
-SUBSTRATES = [6]  # donor substrates to prep
+SUBSTRATES = [4]  # donor substrates to prep
 
 # --- step_1 metadynamics run generation (fills the old "backend" stub) -------
 # In this pipeline the DMC "calc" is a well-tempered metadynamics run, not a
@@ -84,10 +87,10 @@ FORCE_OVERWRITE_RUN = False  # if False, skip a run dir that already has a HILLS
 # The first CV is always the forming C-C bond distance. When ENABLE_SECOND_CV is True the
 # run becomes 2-D well-tempered metadynamics over (C-C distance, proton-transfer coordinate
 # cv2 = d(N,H) - d(O,H)); when False the run stays 1-D over the C-C CV only.
-MTD_N_HEAT, MTD_N_EQUIL, MTD_N_MTD = 10000, 20000, 1000000   # integrator steps
+MTD_N_HEAT, MTD_N_EQUIL, MTD_N_MTD = 10000, 20000, 2000000   # integrator steps
 MTD_SIGMA = 0.1                          # Gaussian width (Å)
 MTD_HEIGHT = 0.5                         # hill height (kcal/mol)
-MTD_PACE = 200                            # deposition stride (steps)
+MTD_PACE = 100                            # deposition stride (steps)
 MTD_BIASFACTOR = 20  # (T + deltaT_bias) / T = (300 + 8000) / 300
 MTD_SEED = 42           # int or None; seeds initial velocities + Langevin noise for a
                           # reproducible run (None = unseeded)
@@ -104,7 +107,7 @@ MTD_GRID_BIN = int((MTD_GRID_MAX - MTD_GRID_MIN)//0.02)
 #                  which may be named differently than the atom literally called "O1")
 # Sign convention: cv2 < 0 reactant (H on N4'), ~0 shared/TS, cv2 > 0 product (H on O1).
 # Expected: reactant ~ -0.5..-0.9 A, TS ~0, product ~ +0.5..+0.9 A.
-ENABLE_SECOND_CV = False      # False -> 1-D run over the C-C CV only (original behavior)
+ENABLE_SECOND_CV = True      # False -> 1-D run over the C-C CV only (original behavior)
 TPP_PROTON_NAME  = "HN4'"    # transferring proton on ThDP N4'
 TPP_DONOR_N_NAME = "N4'"     # proton-donor nitrogen on ThDP
 # cv2 walls/sigma/grid (cv2 is a length difference in A; kappa kcal/mol/A^2). The walls sit

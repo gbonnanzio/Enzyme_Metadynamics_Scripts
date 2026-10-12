@@ -12,8 +12,8 @@ source ~/.bashrc
 conda activate /home/gbf4422/Downloads/miniconda3/envs/jupyter-md-env
 
 # DMC stage (first half of the reaction)
-python 01_generate_DMC_for_MD.py
-#python 02_get_active_DMC_residues.py
+#python 01_generate_DMC_for_MD.py
+python 02_get_active_DMC_residues.py
 #python 03_prepare_DMC_from_MD.py
 
 # AMC stage (second half of the reaction)

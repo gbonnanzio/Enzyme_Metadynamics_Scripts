@@ -9,6 +9,9 @@ import warnings
 # Suppress warnings specific to MDAnalysis
 warnings.filterwarnings("ignore", category=UserWarning, module="MDAnalysis")
 
+# path specific to this cluster
+SYSTEM_PATH = "/projects/p30041/gbf4422/"
+
 # Directory holding this script and its bundled inputs (scripts/, 5EJ5/, substrates_initial/).
 PREP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -29,7 +32,7 @@ target_angles = [79.9,117.6,117.2]
 # load receptor universe and extract the different parts of the protein int1 receptor 
 receptor = mda.Universe(os.path.join(PREP_DIR, '5EJ5', 'DMC_receptor.pdb'))
 
-head_dir = '/projects/p30041/gbf4422/5EJ5/MD_200/DMC/'
+head_dir = f"{SYSTEM_PATH}5EJ5/MD_200/DMC/"
 write_universe(f"{head_dir}receptor/receptor.pdb",receptor)
 edit_protein_files(f"{head_dir}receptor/receptor.pdb",extra_resnames=["TPP","MG"])
 
